@@ -1,0 +1,164 @@
+# 캐시란?
+
+캐시는 시스템의 성능을 최적화하기 위해 자주 사용되는 데이터나 요청의 결과를 미리 저장해 두는 기술입니다. 
+
+프론트엔드와 백엔드의 다양한 레벨에서 캐시를 적용할 수 있습니다. 아래에 각 영역에서 캐시가 적용될 수 있는 부분을 정리해 보았습니다.
+
+## 프론트앤드에서 적용 가능한 캐시
+
+1. 이미지 최적화 
+    - JPEG, PNG 대신 WebP, AVIF와 같은 최신 이미지 포맷 사용.
+    - 최신 포맷은 용량이 작고 품질이 우수하여 빠른 로딩 가능.
+    - CDN 활용 (Cloudflare, AWS CloudFront 등)
+        - 이미지 리소스를 CDN으로 서빙하여 사용자와 가까운 서버에서 빠르게 전송.
+2. 코드 분할
+    - React 애플리케이션은 보통 하나의 번들 파일로 빌드됨
+    하지만 이 파일이 너무 크면 첫 페이지 로딩 시간이 길어질 수 있음.
+    - 이를 해결하기 위해 **코드 분할**을 사용합니다.
+    **코드 분할**이란 애플리케이션의 코드를 여러 개의 작은 청크로 나누어 필요한 시점에만 로드하도록 만드는 기법
+3. API 응답 캐싱
+    - 브라우저 캐싱 (Cache-Control 헤더 활용)
+        - 서버에서 `Cache-Control`을 설정하여 브라우저가 API 응답을 캐싱하도록 설정
+    - API 응답 데이터를 `sessionStorage` 또는 `localStorage` 에 저장 후 재사용
+
+## **커뮤니티 백앤드에서 캐시 적용 가능한 사례**
+
+1. **프로필 이미지 조회**
+    - 사용자의 프로필 이미지는 빈번하게 조회되지만 자주 변경되지 않을 가능성이 높음
+    - **캐시 전략:** 이미지 파일 자체를 CDN에 캐시하거나, 서버 측에서 `Cache-Control` 헤더를 설정하여 클라이언트 측에서 캐싱하도록 유도할 수 있음
+2. **닉네임 조회:**
+    - 사용자의 닉네임 정보는 자주 조회되지만 변경 빈도는 낮음
+    - **캐시 전략:** 닉네임 정보를 Redis와 같은 인메모리 데이터 저장소에 캐시하여 데이터베이스 조회를 최소화할 수 있음
+3. **게시물 목록 조회:**
+    - 커뮤니티의 게시물 목록은 많은 사용자가 빈번하게 조회하지만, 새로운 게시물이 추가될 때만 변경됨
+    - **캐시 전략:** 게시물 목록을 일정 시간 동안 캐시하여 데이터베이스 부하를 줄이고 응답 속도를 향상시킬 수 있음
+4. **댓글 조회:**
+    - **설명:** 게시물에 대한 댓글은 조회 빈도가 높지만, 작성 이후에는 자주 변경되지 않음
+    - **캐시 전략:** 댓글 데이터를 캐시하여 반복적인 데이터베이스 조회를 줄일 수 있음
+5. **조회수 캐싱 최적화**
+
+# 적용 예시
+
+### 기존 게시글 목록을 가져오는 코드
+
+```jsx
+exports.getPosts = async (req, res) => {
+    try {
+        const [posts] = await pool.execute(
+            `SELECT
+                 post.post_id AS id,
+                 post.title,
+                 post.content,
+                 post.image,
+                 post.created_at,
+                 post.views,
+                 user.user_id AS author_id,
+                 user.username AS author,
+                 user.image AS author_image,
+                 (SELECT COUNT(*) FROM comment WHERE comment.post_id = post.post_id) AS comment_count,
+                 (SELECT COUNT(*) FROM \`like\` WHERE \`like\`.post_id = post.post_id) AS like_count
+             FROM post
+             INNER JOIN user ON post.user_id = user.user_id
+             ORDER BY post.created_at DESC`
+        );
+
+        // HTML 엔티티 이스케이프 처리
+        const sanitizedPosts = posts.map(post => ({
+            ...post,
+            title: encode(post.title),
+            content: encode(post.content),
+        }));
+
+        res.status(200).json(sanitizedPosts);
+    } catch (error) {
+        console.error("게시글 목록 가져오기 오류:", error);
+        res.status(500).json({ message: "서버 오류가 발생했습니다." });
+    }
+};
+```
+
+### Redis 캐싱을 적용한 코드
+
+```jsx
+exports.getPosts = async (req, res) => {
+    // 캐싱 키 정의
+    const cacheKey = 'posts:list';
+    
+    try {
+        // Redis 캐시 조회
+        // Redis 캐시가 존재하면 DB조회를 건너뛰고 빠르게 응답 
+        const cachedPosts = await redisClient.get(cacheKey);
+        if (cachedPosts) {
+            return res.status(200).json(JSON.parse(cachedPosts));
+        }
+        
+        // Reids 캐시가 없으면 DB 조회
+        const [posts] = await pool.execute(`
+            SELECT
+                post.post_id AS id,
+                post.title,
+                post.content,
+                post.image,
+                post.created_at,
+                post.views,
+                user.user_id AS author_id,
+                user.username AS author,
+                user.image AS author_image,
+                (SELECT COUNT(*) FROM comment WHERE comment.post_id = post.post_id) AS comment_count,
+                (SELECT COUNT(*) FROM \`like\` WHERE \`like\`.post_id = post.post_id) AS like_count
+            FROM post
+            INNER JOIN user ON post.user_id = user.user_id
+            ORDER BY post.created_at DESC
+        `);
+
+        // Redis에 캐싱 (1시간 만료)
+        await redisClient.set(cacheKey, JSON.stringify(posts), { EX: 3600 });
+
+        res.status(200).json(posts);
+    } catch (error) {
+        console.error("게시글 목록 가져오기 오류:", error);
+        res.status(500).json({ message: "서버 오류가 발생했습니다." });
+    }
+};
+
+```
+
+<aside>
+
+**Redis 캐시**는 데이터를 **인메모리(In-Memory)** 방식으로 저장합니다. 
+즉, RAM(Random Access Memory)에 데이터를 저장하여 빠른 읽기/쓰기 속도를 제공합니다
+
+</aside>
+
+### **게시글 생성, 수정, 삭제 시 캐시 무효화**
+
+- **게시글 생성, 수정, 삭제 시 캐시를 무효화**하면, 다음에 **`getPosts` 요청이 들어올 때**는 캐시가 존재하지 않으므로 **데이터베이스를 조회**하여 최신 데이터를 가져오게 됩니다.
+
+```jsx
+exports.createPost = async (req, res) => {
+    // 게시글 생성 로직
+
+    // 게시글 목록 캐시 무효화
+    await redisClient.del('posts:list');
+};
+
+exports.updatePost = async (req, res) => {
+    // 게시글 수정 로직
+
+    // 게시글 및 목록 캐시 무효화
+    const { postId } = req.params;
+    await redisClient.del(`post:${postId}`);
+    await redisClient.del('posts:list');
+};
+
+exports.deletePost = async (req, res) => {
+    // 게시글 삭제 로직
+
+    // 게시글 및 목록 캐시 무효화
+    const { postId } = req.params;
+    await redisClient.del(`post:${postId}`);
+    await redisClient.del('posts:list');
+};
+```
+
+# 결론
